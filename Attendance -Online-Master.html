@@ -776,6 +776,8 @@
                 <div id="alertContainer"></div>
 
                 <button class="btn" onclick="saveAttendance()">Save</button>
+                <button id="importExcelBtn" class="btn" style="margin-top: 10px;" onclick="triggerImportAttendance()">Import Excel</button>
+                <input id="importExcelInput" type="file" accept=".xlsx,.xls" style="display: none;" />
             </div>
 
             <!-- Summary Tab -->
@@ -867,6 +869,7 @@
                 showMainApp();
             }
              setupFilterEvents();
+             setupImportEvents();
 
         });
 
@@ -892,6 +895,31 @@
             document.getElementById('attendanceDate').addEventListener('change', function() {
                 checkSunday(this.value);
             });
+        }
+
+        function setupImportEvents() {
+            const importInput = document.getElementById('importExcelInput');
+            if (!importInput) {
+                return;
+            }
+
+            importInput.addEventListener('change', importAttendanceFromExcel);
+        }
+
+        function triggerImportAttendance() {
+            if (!currentUser) {
+                showAlert('Please login before importing attendance.', 'error');
+                return;
+            }
+
+            const importInput = document.getElementById('importExcelInput');
+            if (!importInput) {
+                showAlert('Import input not found.', 'error');
+                return;
+            }
+
+            importInput.value = '';
+            importInput.click();
         }
 
         function checkSunday(dateString) {
@@ -1626,7 +1654,7 @@
             const detailsData = [
                 ['DETAILED ATTENDANCE RECORDS'],
                 [''],
-                ['Date', 'Day', 'Subject', 'Hours', 'Status', 'Remarks']
+                ['ISO Date', 'Date', 'Day', 'Subject', 'Hours', 'Status', 'Remarks']
             ];
             
             sortedRecords.forEach(record => {
@@ -1644,6 +1672,7 @@
                 }
                 
                 detailsData.push([
+                    record.date,
                     formattedDate,
                     dayName,
                     record.subject,
@@ -1657,6 +1686,7 @@
             
             // Set column widths for details sheet
             detailsWs['!cols'] = [
+                { wch: 12 }, // ISO Date
                 { wch: 12 }, // Date
                 { wch: 10 }, // Day
                 { wch: 35 }, // Subject
@@ -2094,6 +2124,278 @@
             // Update displays
             loadSummary();
             loadRecords();
+        }
+
+        function normalizeImportedStatus(value) {
+            const statusText = String(value || '').trim().toLowerCase();
+            if (statusText.includes('present')) return 'present';
+            if (statusText.includes('absent')) return 'absent';
+            if (statusText.includes('holiday')) return 'holiday';
+            return null;
+        }
+
+        function toIsoDate(year, month, day) {
+            const y = Number(year);
+            const m = Number(month);
+            const d = Number(day);
+            const date = new Date(y, m - 1, d);
+
+            if (
+                Number.isNaN(date.getTime()) ||
+                date.getFullYear() !== y ||
+                date.getMonth() !== m - 1 ||
+                date.getDate() !== d
+            ) {
+                return null;
+            }
+
+            return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+        }
+
+        function parseImportedDateValue(value) {
+            if (value === null || value === undefined || value === '') {
+                return null;
+            }
+
+            if (value instanceof Date && !Number.isNaN(value.getTime())) {
+                return toIsoDate(value.getFullYear(), value.getMonth() + 1, value.getDate());
+            }
+
+            if (typeof value === 'number' && XLSX && XLSX.SSF && typeof XLSX.SSF.parse_date_code === 'function') {
+                const parsed = XLSX.SSF.parse_date_code(value);
+                if (parsed && parsed.y && parsed.m && parsed.d) {
+                    return toIsoDate(parsed.y, parsed.m, parsed.d);
+                }
+            }
+
+            const text = String(value).trim();
+            if (!text) {
+                return null;
+            }
+
+            const isoMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (isoMatch) {
+                return toIsoDate(isoMatch[1], isoMatch[2], isoMatch[3]);
+            }
+
+            const slashMatch = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+            if (slashMatch) {
+                const first = Number(slashMatch[1]);
+                const second = Number(slashMatch[2]);
+                const year = Number(slashMatch[3]);
+
+                let day = first;
+                let month = second;
+
+                // Prefer dd/mm/yyyy as exported by this app (en-IN); switch when clearly mm/dd.
+                if (first <= 12 && second > 12) {
+                    day = second;
+                    month = first;
+                }
+
+                return toIsoDate(year, month, day);
+            }
+
+            const fallbackDate = new Date(text);
+            if (!Number.isNaN(fallbackDate.getTime())) {
+                return toIsoDate(
+                    fallbackDate.getFullYear(),
+                    fallbackDate.getMonth() + 1,
+                    fallbackDate.getDate()
+                );
+            }
+
+            return null;
+        }
+
+        function getImportColumnIndexes(headerRow) {
+            const normalizedHeaders = headerRow.map((cell) => String(cell || '').trim().toLowerCase());
+            const findColumn = (...aliases) => normalizedHeaders.findIndex((header) => aliases.includes(header));
+
+            const isoDateIndex = findColumn('iso date', 'iso_date', 'iso');
+            const dateIndex = findColumn('date');
+            const subjectIndex = findColumn('subject');
+            const hoursIndex = findColumn('hours', 'hour');
+            const statusIndex = findColumn('status');
+
+            return {
+                isoDateIndex,
+                dateIndex,
+                subjectIndex,
+                hoursIndex,
+                statusIndex,
+                valid: subjectIndex >= 0 && hoursIndex >= 0 && statusIndex >= 0 && (isoDateIndex >= 0 || dateIndex >= 0)
+            };
+        }
+
+        function parseAttendanceRowsFromSheet(sheet) {
+            const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+            if (!rows.length) {
+                return { records: [], warnings: ['Selected sheet is empty.'] };
+            }
+
+            let headerIndex = -1;
+            let columns = null;
+            const scanLimit = Math.min(rows.length, 30);
+
+            for (let i = 0; i < scanLimit; i++) {
+                const candidate = getImportColumnIndexes(rows[i]);
+                if (candidate.valid) {
+                    headerIndex = i;
+                    columns = candidate;
+                    break;
+                }
+            }
+
+            if (headerIndex === -1 || !columns) {
+                return { records: [], warnings: ['Could not find required columns (Date, Subject, Hours, Status).'] };
+            }
+
+            const warnings = [];
+            const uniqueRecords = new Map();
+
+            for (let i = headerIndex + 1; i < rows.length; i++) {
+                const row = rows[i] || [];
+                const rowNumber = i + 1;
+                const rowHasValues = row.some((cell) => String(cell === null || cell === undefined ? '' : cell).trim() !== '');
+                if (!rowHasValues) {
+                    continue;
+                }
+
+                const subject = String(row[columns.subjectIndex] || '').trim();
+                const rawHours = Number(row[columns.hoursIndex]);
+                const hours = Math.round(rawHours * 100) / 100;
+                const status = normalizeImportedStatus(row[columns.statusIndex]);
+                const isoDatePrimary = columns.isoDateIndex >= 0 ? parseImportedDateValue(row[columns.isoDateIndex]) : null;
+                const isoDateFallback = columns.dateIndex >= 0 ? parseImportedDateValue(row[columns.dateIndex]) : null;
+                const date = isoDatePrimary || isoDateFallback;
+
+                if (!date || !subject || !Number.isFinite(hours) || hours <= 0 || !status) {
+                    warnings.push(`Row ${rowNumber} skipped due to invalid data.`);
+                    continue;
+                }
+
+                const key = `${date}::${subject.toLowerCase()}`;
+                uniqueRecords.set(key, { date, subject, hours, status });
+            }
+
+            return { records: Array.from(uniqueRecords.values()), warnings };
+        }
+
+        function parseAttendanceRecordsFromWorkbook(workbook) {
+            const orderedSheets = [];
+
+            if (workbook.Sheets['Detailed Records']) {
+                orderedSheets.push('Detailed Records');
+            }
+
+            workbook.SheetNames.forEach((sheetName) => {
+                if (!orderedSheets.includes(sheetName)) {
+                    orderedSheets.push(sheetName);
+                }
+            });
+
+            let combinedWarnings = [];
+            for (const sheetName of orderedSheets) {
+                const sheet = workbook.Sheets[sheetName];
+                if (!sheet) {
+                    continue;
+                }
+
+                const parsed = parseAttendanceRowsFromSheet(sheet);
+                if (parsed.records.length > 0) {
+                    return parsed;
+                }
+
+                combinedWarnings = parsed.warnings || [];
+            }
+
+            return { records: [], warnings: combinedWarnings };
+        }
+
+        async function importAttendanceFromExcel(event) {
+            const importInput = event.target;
+            const importButton = document.getElementById('importExcelBtn');
+            const selectedFile = importInput && importInput.files ? importInput.files[0] : null;
+
+            if (!selectedFile) {
+                return;
+            }
+
+            if (!/\.xlsx?$/.test(selectedFile.name.toLowerCase())) {
+                showAlert('Please select a valid Excel file (.xlsx or .xls).', 'error');
+                importInput.value = '';
+                return;
+            }
+
+            if (!currentUser) {
+                showAlert('Please login before importing attendance.', 'error');
+                importInput.value = '';
+                return;
+            }
+
+            if (importButton) {
+                importButton.disabled = true;
+                importButton.textContent = 'Importing...';
+            }
+
+            try {
+                const fileBuffer = await selectedFile.arrayBuffer();
+                const workbook = XLSX.read(fileBuffer, { type: 'array', cellDates: true });
+                const parsed = parseAttendanceRecordsFromWorkbook(workbook);
+                const recordsToImport = parsed.records || [];
+
+                if (recordsToImport.length === 0) {
+                    showAlert('No valid attendance rows found in the selected file.', 'error');
+                    return;
+                }
+
+                let importedCount = 0;
+                let failedCount = 0;
+
+                for (const record of recordsToImport) {
+                    try {
+                        await apiRequest(`/api/attendance/${encodeURIComponent(currentUser)}`, {
+                            method: 'POST',
+                            body: {
+                                ...record,
+                                upsert: true
+                            }
+                        });
+                        importedCount++;
+                    } catch (error) {
+                        failedCount++;
+                    }
+                }
+
+                await refreshAttendanceRecords();
+                loadSummary();
+                loadRecords();
+
+                if (failedCount === 0) {
+                    showAlert(`Imported ${importedCount} record(s) successfully.`, 'success');
+                } else if (importedCount === 0) {
+                    showAlert(`Import failed for ${failedCount} record(s).`, 'error');
+                } else {
+                    showAlert(`Imported ${importedCount} record(s), failed ${failedCount}.`, 'success');
+                }
+
+                if (parsed.warnings && parsed.warnings.length > 0) {
+                    console.warn('Import warnings:', parsed.warnings);
+                }
+            } catch (error) {
+                console.error('Excel import error:', error);
+                showAlert('Failed to import Excel file. Please check file format.', 'error');
+            } finally {
+                if (importButton) {
+                    importButton.disabled = false;
+                    importButton.textContent = 'Import Excel';
+                }
+
+                if (importInput) {
+                    importInput.value = '';
+                }
+            }
         }
 
         function loadSummary() {
