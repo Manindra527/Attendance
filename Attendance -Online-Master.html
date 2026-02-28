@@ -2012,7 +2012,7 @@
                 document.getElementById('mainApp').classList.remove('hidden');
 
                 const userProfile = await fetchUserProfile(currentUser);
-                document.getElementById('welcomeText').textContent = `Welcome, ${userProfile.name}!`;
+                document.getElementById('welcomeText').textContent = `Welcome, Mr. ${userProfile.name}!`;
                 document.getElementById('userInfo').textContent = `${userProfile.rollNumber} | ${userProfile.branch}`;
                 
                 loadSubjectsByBranch(userProfile.branch);
@@ -2652,4 +2652,5 @@
     </script>
 </body>
 </html>
+
 
